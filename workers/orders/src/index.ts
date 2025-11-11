@@ -15,6 +15,7 @@ interface Env {
   SUPABASE_ANON_KEY: string
   AUTH0_DOMAIN: string
   AUTH0_AUDIENCE?: string
+  AUTH0_CLIENT_ID?: string // Client ID for ID token audience validation
 }
 
 interface CartItem {
@@ -52,9 +53,25 @@ async function verifyAuth0JWT(
       new URL(`https://${env.AUTH0_DOMAIN}/.well-known/jwks.json`)
     )
 
+    // For ID tokens, the audience is typically the Client ID
+    // For access tokens, the audience is the API identifier
+    // We'll accept either one for flexibility
+    const audiences: string[] = []
+    if (env.AUTH0_CLIENT_ID) {
+      audiences.push(env.AUTH0_CLIENT_ID)
+    }
+    if (env.AUTH0_AUDIENCE) {
+      audiences.push(env.AUTH0_AUDIENCE)
+    }
+    // Fallback to default API audience if neither is set
+    if (audiences.length === 0) {
+      audiences.push(`https://${env.AUTH0_DOMAIN}/api/v2/`)
+    }
+
     const { payload } = await jwtVerify(token, JWKS, {
       issuer: `https://${env.AUTH0_DOMAIN}/`,
-      audience: env.AUTH0_AUDIENCE || `https://${env.AUTH0_DOMAIN}/api/v2/`,
+      // Accept any of the valid audiences
+      audience: audiences.length === 1 ? audiences[0] : audiences,
     })
 
     return {
