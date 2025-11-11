@@ -1,0 +1,16 @@
+name = "orders-submit"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# Environment variables (set via wrangler secret put or .dev.vars)
+# SUPABASE_URL = "your-supabase-url"
+# SUPABASE_ANON_KEY = "your-supabase-anon-key"
+# AUTH0_DOMAIN = "your-auth0-domain"
+# AUTH0_AUDIENCE = "your-auth0-audience" (optional)
+
+[env.development]
+name = "orders-submit-dev"
+
+[env.production]
+name = "orders-submit-prod"
+
