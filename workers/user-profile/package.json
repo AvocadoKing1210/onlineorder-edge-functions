@@ -1,0 +1,25 @@
+{
+  "name": "user-profile",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for user profile management (create/update) used during checkout",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dev": "wrangler deploy --env development",
+    "deploy:prod": "wrangler deploy --env production",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["cloudflare", "workers", "user-profile", "supabase"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251109.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.46.0"
+  },
+  "dependencies": {
+    "jose": "^6.1.1"
+  }
+}
+

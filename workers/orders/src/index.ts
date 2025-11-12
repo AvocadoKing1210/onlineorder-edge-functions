@@ -28,12 +28,27 @@ interface CartItem {
   notes?: string
 }
 
+interface DeliveryAddress {
+  street: string
+  city: string
+  province: string
+  postal_code: string
+  country?: string
+  unit?: string
+  instructions?: string
+}
+
 interface OrderSubmissionRequest {
   cart: CartItem[]
   mode: 'dine_in' | 'takeout' | 'delivery'
   special_instructions?: string
   idempotency_key?: string
   user_id?: string // For guest checkout
+  // Customer information
+  customer_name?: string
+  customer_email?: string
+  customer_phone?: string
+  delivery_address?: DeliveryAddress
 }
 
 interface OrderResponse {
@@ -188,6 +203,10 @@ async function createOrder(
     total_amount: number
     special_instructions?: string
     idempotency_key?: string
+    customer_name?: string
+    customer_email?: string
+    customer_phone?: string
+    delivery_address?: DeliveryAddress
   },
   user: { sub: string },
   env: Env
@@ -287,7 +306,17 @@ export default {
     try {
       // Parse request
       const body: OrderSubmissionRequest = await request.json()
-      const { cart, mode, special_instructions, idempotency_key, user_id: bodyUserId } = body
+      const { 
+        cart, 
+        mode, 
+        special_instructions, 
+        idempotency_key, 
+        user_id: bodyUserId,
+        customer_name,
+        customer_email,
+        customer_phone,
+        delivery_address,
+      } = body
 
       // Get user_id - either from JWT (authenticated) or request body (guest)
       // Auth0 is optional - only verify if token provided, otherwise use guest user_id
@@ -331,6 +360,10 @@ export default {
           ...totals,
           special_instructions,
           idempotency_key,
+          customer_name,
+          customer_email,
+          customer_phone,
+          delivery_address: delivery_address || undefined,
         },
         { sub: user_id },
         env

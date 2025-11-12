@@ -1,0 +1,21 @@
+name = "menu-process"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+# Cloudflare AI binding
+# This enables access to Cloudflare AI models
+[ai]
+binding = "AI"
+
+[env.development]
+name = "menu-process-dev"
+
+[env.development.ai]
+binding = "AI"
+
+[env.production]
+name = "menu-process-prod"
+
+[env.production.ai]
+binding = "AI"
+
