@@ -5,6 +5,7 @@ Cloudflare Worker for extracting text from images using Cloudflare AI Workers wi
 ## Features
 
 - ✅ **Vision AI Text Extraction**: Uses Cloudflare's Llama 3.2 11B Vision model
+- ✅ **Multiple Image Support**: Process single or multiple images in one request
 - ✅ **Structured JSON Output**: Automatically extracts menu items into structured JSON format
 - ✅ **Complete Menu Extraction**: Extracts all menu items (40+ items) with IDs, names, descriptions, prices, and categories
 - ✅ **Multiple Input Formats**: Supports file uploads, image URLs, base64 encoded images, and data URIs
@@ -35,13 +36,23 @@ No environment variables are required! The Cloudflare AI binding is automaticall
 
 ### Method 1: File Upload (Postman/Form Data) - Recommended
 
-**Using Postman:**
+**Using Postman (Single Image):**
 1. Set method to `POST`
 2. Set URL to `http://localhost:8787` (or your deployed URL)
 3. Go to **Body** tab
 4. Select **form-data**
 5. Add a key named `image` with type **File**
 6. Click **Select Files** and choose your image file
+7. (Optional) Add another key named `prompt` with type **Text** for custom extraction prompt
+8. Send the request
+
+**Using Postman (Multiple Images):**
+1. Set method to `POST`
+2. Set URL to `http://localhost:8787` (or your deployed URL)
+3. Go to **Body** tab
+4. Select **form-data**
+5. Add multiple keys named `images` (all with the same name) with type **File**
+6. Click **Select Files** and choose multiple image files
 7. (Optional) Add another key named `prompt` with type **Text** for custom extraction prompt
 8. Send the request
 
@@ -60,6 +71,21 @@ Content-Type: application/json
 
 {
   "image_url": "https://example.com/menu.jpg"
+}
+```
+
+### Method 2b: JSON with Multiple Image URLs
+
+```bash
+POST http://localhost:8787
+Content-Type: application/json
+
+{
+  "images": [
+    "https://example.com/menu-page1.jpg",
+    "https://example.com/menu-page2.jpg",
+    "https://example.com/menu-page3.jpg"
+  ]
 }
 ```
 
@@ -86,7 +112,7 @@ Content-Type: application/json
 }
 ```
 
-### Response
+### Response (Single Image)
 
 The response includes both the raw text and parsed JSON (if extraction was successful):
 
@@ -131,6 +157,47 @@ The response includes both the raw text and parsed JSON (if extraction was succe
 
 **Note**: The `json` field will be `null` if JSON parsing fails, but the `text` field will always contain the raw AI response. Check `item_count` to verify all items were extracted (should be ~48 for the test menu).
 
+### Response (Multiple Images)
+
+When multiple images are provided, the response structure changes:
+
+```json
+{
+  "results": [
+    {
+      "image_index": 0,
+      "text": "Raw text response from AI...",
+      "json": {
+        "items": [...],
+        "categories": [...],
+        "sections": [...]
+      },
+      "parse_error": null,
+      "item_count": 48
+    },
+    {
+      "image_index": 1,
+      "text": "Raw text response from AI...",
+      "json": {
+        "items": [...],
+        "categories": [...],
+        "sections": [...]
+      },
+      "parse_error": null,
+      "item_count": 32
+    }
+  ],
+  "total_items": 80,
+  "model": "@cf/meta/llama-3.2-11b-vision-instruct",
+  "processed_at": "2024-11-10T14:30:22.000Z"
+}
+```
+
+**Multiple Image Response Fields:**
+- `results`: Array of extraction results, one per image
+- `total_items`: Sum of all items extracted from all images
+- Each result includes `image_index`, `text`, `json`, `parse_error`, and `item_count`
+
 ### Error Responses
 
 - `400`: Invalid request (missing image, invalid image format)
@@ -140,15 +207,23 @@ The response includes both the raw text and parsed JSON (if extraction was succe
 ## Request Body Options
 
 ### For File Upload (multipart/form-data):
-- `image` (File, required): Image file to upload
+- `image` (File, optional): Single image file to upload
+- `images` (File[], optional): Multiple image files (use same field name for all)
 - `prompt` (string, optional): Custom prompt for extraction
 
-### For JSON Body:
-- `image` (string, optional): Base64 encoded image or data URI
-- `image_url` (string, optional): URL to the image
-- `prompt` (string, optional): Custom prompt for extraction. Default: "Extract all text from this image..."
+**Note**: Use either `image` (single) or `images` (multiple). If multiple `images` are provided, results will be returned as an array.
 
-**Note**: For JSON requests, either `image` or `image_url` must be provided. For file uploads, the `image` file field is required.
+### For JSON Body:
+- `image` (string, optional): Base64 encoded image or data URI (single)
+- `image_url` (string, optional): URL to the image (single)
+- `images` (string[], optional): Array of base64 images or URLs (multiple)
+- `prompt` (string, optional): Custom prompt for extraction. Default: optimized menu extraction prompt
+
+**Note**: For JSON requests, provide either:
+- Single image: `image` or `image_url`
+- Multiple images: `images` array
+
+When multiple images are provided, the response will include a `results` array with extraction results for each image.
 
 ## Deployment
 
@@ -206,7 +281,8 @@ The default prompt is optimized for restaurant menus and will extract:
 - Special indicators (vegetarian, spicy, etc.)
 
 **Improvements:**
-- **Optimized max_tokens to 4096** (4k - from default 256) to handle all menu items without timeouts
+- **Optimized max_tokens to 2048** (2k - from default 256) to prevent timeouts while handling menu items
+- **Text-to-JSON parser fallback** - automatically converts text responses to JSON format
 - Ultra-concise prompt to minimize processing time and token usage
 - Enhanced prompt with explicit item counts and section details
 - Improved JSON parsing that handles incomplete or wrapped responses
@@ -218,14 +294,15 @@ The default prompt is optimized for restaurant menus and will extract:
 - **Model**: `@cf/meta/llama-3.2-11b-vision-instruct`
 - **Type**: Vision-language model
 - **Context Window**: Up to 128,000 tokens
-- **Max Output Tokens**: 4,096 tokens (4k - optimized to prevent timeouts)
+- **Max Output Tokens**: 2,048 tokens (2k - optimized to prevent timeouts)
 - **Capabilities**: Text extraction, image understanding, structured data extraction
 
 **Token Configuration:**
 - Default `max_tokens` is 256 (too low for large menus)
-- This worker sets `max_tokens: 4096` (4k - optimized to prevent timeouts)
+- This worker sets `max_tokens: 2048` (2k - optimized to prevent timeouts)
 - Model supports up to 128,000 tokens total context window (includes both input and output)
-- **Important**: Higher values (8k+) cause 504 Gateway Timeout errors (~60s execution limit)
-- **Why 4k?**: 4k tokens = ~3000 words, sufficient for 48 menu items with concise JSON format
+- **Important**: Higher values (4k+) cause 504 Gateway Timeout errors (~60s execution limit)
+- **Why 2k?**: Processing time increases with max_tokens. 2k tokens is safer for the 60s timeout limit
+- **Fallback**: If response is truncated, the text parser will extract items from partial responses
 - The prompt is ultra-concise to minimize processing time and token usage
 
