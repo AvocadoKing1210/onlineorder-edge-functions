@@ -16,6 +16,8 @@ interface Env {
   AUTH0_DOMAIN: string
   AUTH0_AUDIENCE?: string
   AUTH0_CLIENT_ID?: string // Client ID for ID token audience validation
+  ORDER_RATE_LIMITER?: any // Rate limiter binding
+  ALLOWED_ORIGINS?: string // Comma-separated list of allowed origins (e.g., "https://example.com,https://app.example.com")
 }
 
 interface CartItem {
@@ -280,19 +282,68 @@ async function createOrderItems(
   }
 }
 
+// Get CORS headers based on request origin and allowed origins
+// Returns { headers: Record<string, string>, allowed: boolean }
+function getCorsHeaders(request: Request, env: Env): { headers: Record<string, string>; allowed: boolean } {
+  const origin = request.headers.get('Origin')
+  const allowedOrigins = env.ALLOWED_ORIGINS
+    ? env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : []
+
+  // If no allowed origins configured, allow all (backward compatibility)
+  // In production, you should always set ALLOWED_ORIGINS
+  let allowOrigin = '*'
+  let isAllowed = true
+  
+  if (allowedOrigins.length > 0) {
+    // If origin is provided and is in allowed list, use it
+    if (origin && allowedOrigins.includes(origin)) {
+      allowOrigin = origin
+      isAllowed = true
+    } else if (origin) {
+      // Origin provided but not allowed - deny CORS
+      isAllowed = false
+      return { headers: {}, allowed: false }
+    } else {
+      // No origin header (same-origin request) - allow it
+      allowOrigin = '*'
+      isAllowed = true
+    }
+  }
+
+  return {
+    headers: {
+      'Access-Control-Allow-Origin': allowOrigin,
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400', // Cache preflight for 24 hours
+    },
+    allowed: isAllowed,
+  }
+}
+
 // Main handler
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // Get CORS headers based on origin
+    const cors = getCorsHeaders(request, env)
+    const corsHeaders = cors.headers
+
+    // Handle OPTIONS request (CORS preflight)
+    if (request.method === 'OPTIONS') {
+      // If origin is not allowed, return 403
+      if (!cors.allowed) {
+        return new Response(null, { status: 403 })
+      }
+      return new Response(null, { headers: corsHeaders })
     }
 
-    // Handle OPTIONS request
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders })
+    // For actual requests, if origin is not allowed, return 403
+    if (!cors.allowed) {
+      return new Response(
+        JSON.stringify({ error: 'Origin not allowed' }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } }
+      )
     }
 
     // Only allow POST
@@ -304,6 +355,48 @@ export default {
     }
 
     try {
+      // Rate limiting - limit by IP address or user identifier
+      if (env.ORDER_RATE_LIMITER) {
+        const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown'
+        const authHeader = request.headers.get('Authorization')
+        
+        // Use IP for guests, or attempt to extract user ID from token for authenticated users
+        let rateLimitKey = clientIP
+        
+        if (authHeader?.startsWith('Bearer ')) {
+          try {
+            const token = authHeader.substring(7)
+            const jwt = await verifyAuth0JWT(token, env)
+            // Use user ID for authenticated users (more accurate rate limiting)
+            if (jwt?.sub) {
+              rateLimitKey = jwt.sub
+            }
+          } catch {
+            // If token verification fails, fall back to IP
+            rateLimitKey = clientIP
+          }
+        }
+        
+        const { success } = await env.ORDER_RATE_LIMITER.limit({ key: rateLimitKey })
+        
+        if (!success) {
+          return new Response(
+            JSON.stringify({ 
+              error: 'Rate limit exceeded. Please try again later.',
+              retry_after: 60
+            }),
+            { 
+              status: 429, 
+              headers: { 
+                ...corsHeaders, 
+                'Content-Type': 'application/json',
+                'Retry-After': '60'
+              } 
+            }
+          )
+        }
+      }
+
       // Parse request
       const body: OrderSubmissionRequest = await request.json()
       const { 
@@ -311,29 +404,55 @@ export default {
         mode, 
         special_instructions, 
         idempotency_key, 
-        user_id: bodyUserId,
+        // Note: user_id is intentionally ignored for security - generated server-side
         customer_name,
         customer_email,
         customer_phone,
         delivery_address,
       } = body
 
-      // Get user_id - either from JWT (authenticated) or request body (guest)
-      // Auth0 is optional - only verify if token provided, otherwise use guest user_id
+      // Get user_id - SECURITY: Never trust client-provided user_id
+      // For authenticated users: Always use JWT sub claim
+      // For guest users: Generate secure server-side ID
       const authHeader = request.headers.get('Authorization')
       let user_id: string
 
       if (authHeader?.startsWith('Bearer ')) {
-        // Optional: Verify Auth0 JWT for authenticated users
+        // Authenticated user - verify JWT and use sub claim
         const token = authHeader.substring(7)
         const jwt = await verifyAuth0JWT(token, env)
-        user_id = jwt?.sub || bodyUserId || `guest-${Date.now()}`
-      } else if (bodyUserId) {
-        // Guest checkout - use provided user_id (no Auth0 verification needed)
-        user_id = bodyUserId
+        
+        if (!jwt) {
+          return new Response(
+            JSON.stringify({ error: 'Invalid or expired token' }),
+            { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          )
+        }
+        
+        // SECURITY: Always use JWT sub, ignore any client-provided user_id
+        user_id = jwt.sub
       } else {
-        // Generate guest user_id if none provided
-        user_id = `guest-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`
+        // Guest checkout - generate secure server-side ID
+        // Never trust client-provided user_id for security
+        const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown'
+        const timestamp = Date.now()
+        const randomBytes = crypto.getRandomValues(new Uint8Array(8))
+        const randomHex = Array.from(randomBytes)
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('')
+        
+        // Create a secure guest ID using IP hash + timestamp + random
+        // This prevents user_id manipulation while allowing guest checkout
+        const ipHashBuffer = await crypto.subtle.digest(
+          'SHA-256',
+          new TextEncoder().encode(clientIP)
+        )
+        const ipHash = Array.from(new Uint8Array(ipHashBuffer))
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('')
+          .substring(0, 16)
+        
+        user_id = `guest-${ipHash}-${timestamp}-${randomHex.substring(0, 16)}`
       }
 
       // Validate cart

@@ -7,10 +7,31 @@ compatibility_date = "2024-11-01"
 # SUPABASE_ANON_KEY = "your-supabase-anon-key"
 # AUTH0_DOMAIN = "your-auth0-domain"
 # AUTH0_AUDIENCE = "your-auth0-audience" (optional)
+# ALLOWED_ORIGINS = "https://example.com,https://app.example.com" (optional, comma-separated)
+#   If not set, allows all origins (*) - NOT RECOMMENDED for production
+
+# Rate limiting configuration
+# Note: You need to create a rate limit namespace in Cloudflare Dashboard first
+# Dashboard > Workers & Pages > Rate Limits > Create
+# Then use the namespace_id here
+[[ratelimits]]
+name = "ORDER_RATE_LIMITER"
+namespace_id = "1001"  # Replace with your actual namespace ID from Cloudflare Dashboard
+simple = { limit = 20, period = 60 }  # 20 requests per 60 seconds
 
 [env.development]
 name = "orders-submit-dev"
 
+[[env.development.ratelimits]]
+name = "ORDER_RATE_LIMITER"
+namespace_id = "1001"  # Can use same or different namespace for dev
+simple = { limit = 50, period = 60 }  # More lenient for development
+
 [env.production]
 name = "orders-submit-prod"
+
+[[env.production.ratelimits]]
+name = "ORDER_RATE_LIMITER"
+namespace_id = "1001"  # Replace with your production namespace ID
+simple = { limit = 10, period = 60 }  # Stricter for production
 
