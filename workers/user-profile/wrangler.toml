@@ -5,12 +5,51 @@ compatibility_date = "2024-11-01"
 # Environment variables (set via wrangler secret put or .dev.vars)
 # SUPABASE_URL = "your-supabase-url"
 # SUPABASE_ANON_KEY = "your-supabase-anon-key"
+# SUPABASE_SERVICE_ROLE_KEY = "your-service-role-key"
 # AUTH0_DOMAIN = "your-auth0-domain"
 # AUTH0_AUDIENCE = "your-auth0-audience" (optional)
+# AUTH0_CLIENT_ID = "your-auth0-client-id" (optional)
+# API_KEY = "your-secret-api-key" (required for server-to-server auth from Next.js)
+# ALLOWED_ORIGINS = "https://example.com,https://app.example.com" (optional, comma-separated)
+#   If not set, allows all origins (*) - NOT RECOMMENDED for production
+#   Note: API key requests bypass CORS check
+
+# Rate limiting configuration
+# Note: You need to create a rate limit namespace in Cloudflare Dashboard first
+# Dashboard > Workers & Pages > Rate Limits > Create
+# Then use the namespace_id here
+[[ratelimits]]
+name = "PROFILE_RATE_LIMITER"
+namespace_id = "1001"  # Replace with your actual namespace ID from Cloudflare Dashboard
+simple = { limit = 30, period = 60 }  # 30 requests per 60 seconds
 
 [env.development]
 name = "user-profile-dev"
 
+[[env.development.ratelimits]]
+name = "PROFILE_RATE_LIMITER"
+namespace_id = "1001"  # Can use same or different namespace for dev
+simple = { limit = 50, period = 60 }  # More lenient for development
+
 [env.production]
 name = "user-profile-prod"
 
+[[env.production.ratelimits]]
+name = "PROFILE_RATE_LIMITER"
+namespace_id = "1001"  # Replace with your production namespace ID
+simple = { limit = 20, period = 60 }  # Stricter for production (20 requests per minute)
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1

@@ -7,11 +7,34 @@ compatibility_date = "2024-11-01"
 [ai]
 binding = "AI"
 
+# Environment variables (set via wrangler secret put or .dev.vars)
+# API_KEY = "your-secret-api-key" (required for server-to-server auth from Next.js)
+# ALLOWED_ORIGINS = "https://example.com,https://app.example.com" (optional, comma-separated)
+#   If not set, allows all origins (*) - NOT RECOMMENDED for production
+#   Note: API key requests bypass CORS check
+# ALLOWED_IMAGE_DOMAINS = "example.com,cdn.example.com" (optional, comma-separated)
+#   If set, only images from these domains can be processed via URL (SSRF protection)
+
+# Rate limiting configuration
+# CRITICAL: AI processing is expensive - strict rate limits are essential
+# Note: You need to create a rate limit namespace in Cloudflare Dashboard first
+# Dashboard > Workers & Pages > Rate Limits > Create
+# Then use the namespace_id here
+[[ratelimits]]
+name = "MENU_PROCESS_RATE_LIMITER"
+namespace_id = "1001"  # Replace with your actual namespace ID from Cloudflare Dashboard
+simple = { limit = 5, period = 60 }  # 5 requests per 60 seconds (very strict due to AI cost)
+
 [env.development]
 name = "menu-process-dev"
 
 [env.development.ai]
 binding = "AI"
+
+[[env.development.ratelimits]]
+name = "MENU_PROCESS_RATE_LIMITER"
+namespace_id = "1001"  # Can use same or different namespace for dev
+simple = { limit = 10, period = 60 }  # More lenient for development (10 requests per minute)
 
 [env.production]
 name = "menu-process-prod"
@@ -19,3 +42,22 @@ name = "menu-process-prod"
 [env.production.ai]
 binding = "AI"
 
+[[env.production.ratelimits]]
+name = "MENU_PROCESS_RATE_LIMITER"
+namespace_id = "1001"  # Replace with your production namespace ID
+simple = { limit = 3, period = 60 }  # Very strict for production (3 requests per minute) - AI is expensive!
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1

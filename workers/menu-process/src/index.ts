@@ -7,8 +7,11 @@
 
 // Types
 interface Env {
-  // No environment variables required for Cloudflare AI
-  // AI binding is automatically available in Cloudflare Workers
+  AI?: any // Cloudflare AI binding
+  MENU_PROCESS_RATE_LIMITER?: any // Rate limiter binding
+  ALLOWED_ORIGINS?: string // Comma-separated list of allowed origins
+  API_KEY?: string // API key for server-to-server authentication
+  ALLOWED_IMAGE_DOMAINS?: string // Comma-separated list of allowed image URL domains (optional, for SSRF protection)
 }
 
 interface TextExtractionRequest {
@@ -117,6 +120,91 @@ function parseTextToJSON(text: string): MenuExtraction | null {
   }
 }
 
+// Validate URL to prevent SSRF attacks
+function isValidImageUrl(url: string, env: Env): { valid: boolean; reason?: string } {
+  try {
+    const urlObj = new URL(url)
+    
+    // Only allow http/https protocols
+    if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') {
+      return { valid: false, reason: 'Only http and https protocols are allowed' }
+    }
+    
+    // Block private IP addresses (SSRF protection)
+    const hostname = urlObj.hostname
+    const privateIPPatterns = [
+      /^127\./,
+      /^10\./,
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
+      /^192\.168\./,
+      /^169\.254\./,
+      /^::1$/,
+      /^fc00:/,
+      /^fe80:/,
+      /^localhost$/i,
+    ]
+    
+    for (const pattern of privateIPPatterns) {
+      if (pattern.test(hostname)) {
+        return { valid: false, reason: 'Private/internal IP addresses are not allowed' }
+      }
+    }
+    
+    // If allowed domains are configured, check against whitelist
+    if (env.ALLOWED_IMAGE_DOMAINS) {
+      const allowedDomains = env.ALLOWED_IMAGE_DOMAINS.split(',').map(d => d.trim().toLowerCase())
+      const hostnameLower = hostname.toLowerCase()
+      
+      const isAllowed = allowedDomains.some(domain => {
+        // Support exact match or subdomain match
+        return hostnameLower === domain || hostnameLower.endsWith('.' + domain)
+      })
+      
+      if (!isAllowed) {
+        return { valid: false, reason: 'Image URL domain is not in allowed list' }
+      }
+    }
+    
+    return { valid: true }
+  } catch (error) {
+    return { valid: false, reason: 'Invalid URL format' }
+  }
+}
+
+// Sanitize prompt to prevent prompt injection
+function sanitizePrompt(prompt: string | undefined): string {
+  if (!prompt) {
+    return '' // Will use default prompt
+  }
+  
+  // Remove potential prompt injection patterns
+  const injectionPatterns = [
+    /ignore\s+(previous|all|the)\s+(instructions?|prompts?|rules?)/gi,
+    /you\s+are\s+now/gi,
+    /forget\s+(previous|all|the)/gi,
+    /system\s*:\s*/gi,
+    /assistant\s*:\s*/gi,
+  ]
+  
+  let sanitized = prompt
+  
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(sanitized)) {
+      // If injection pattern detected, reject the custom prompt and use default
+      console.warn('Prompt injection attempt detected in custom prompt, using default prompt')
+      return '' // Will trigger default prompt
+    }
+  }
+  
+  // Limit prompt length to prevent flooding
+  const MAX_PROMPT_LENGTH = 500
+  if (sanitized.length > MAX_PROMPT_LENGTH) {
+    sanitized = sanitized.substring(0, MAX_PROMPT_LENGTH)
+  }
+  
+  return sanitized
+}
+
 // Extract text from image using Cloudflare AI
 async function extractText(
   imageInput: string | ArrayBuffer,
@@ -130,7 +218,12 @@ async function extractText(
     if (typeof imageInput === 'string') {
       // String input: URL or base64
       if (imageInput.startsWith('http://') || imageInput.startsWith('https://')) {
-        // Pass URL directly - Cloudflare AI can fetch it
+        // Validate URL to prevent SSRF
+        const urlValidation = isValidImageUrl(imageInput, env)
+        if (!urlValidation.valid) {
+          throw new Error(`Invalid image URL: ${urlValidation.reason}`)
+        }
+        // Pass URL directly - Cloudflare AI can fetch it (after validation)
         imageParam = imageInput
       } else {
         // Convert base64 to array of bytes
@@ -182,19 +275,79 @@ async function extractText(
   }
 }
 
+// Get CORS headers based on request origin and allowed origins
+function getCorsHeaders(request: Request, env: Env): { headers: Record<string, string>; allowed: boolean } {
+  const origin = request.headers.get('Origin')
+  const allowedOrigins = env.ALLOWED_ORIGINS
+    ? env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : []
+
+  // If no allowed origins configured, allow all (backward compatibility)
+  // In production, you should always set ALLOWED_ORIGINS
+  let allowOrigin = '*'
+  let isAllowed = true
+
+  if (allowedOrigins.length > 0) {
+    // If origin is provided and is in allowed list, use it
+    if (origin && allowedOrigins.includes(origin)) {
+      allowOrigin = origin
+      isAllowed = true
+    } else if (origin) {
+      // Origin provided but not allowed - deny CORS
+      isAllowed = false
+      return { headers: {}, allowed: false }
+    } else {
+      // No origin header (same-origin request) - allow it
+      allowOrigin = '*'
+      isAllowed = true
+    }
+  }
+
+  return {
+    headers: {
+      'Access-Control-Allow-Origin': allowOrigin,
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
+      'Access-Control-Max-Age': '86400', // Cache preflight for 24 hours
+    },
+    allowed: isAllowed,
+  }
+}
+
 // Main handler
 export default {
   async fetch(request: Request, env: Env & { AI: any }): Promise<Response> {
-    // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // Verify API key if configured (for server-to-server requests from Next.js)
+    if (env.API_KEY) {
+      const apiKey = request.headers.get('X-API-Key')
+      if (!apiKey || apiKey !== env.API_KEY) {
+        return new Response(
+          JSON.stringify({ error: 'Unauthorized: Invalid API key' }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } }
+        )
+      }
     }
 
-    // Handle OPTIONS request
+    // Get CORS headers based on origin
+    const cors = getCorsHeaders(request, env)
+    const corsHeaders = cors.headers
+
+    // Handle OPTIONS request (CORS preflight)
     if (request.method === 'OPTIONS') {
+      // If origin is not allowed, return 403
+      if (!cors.allowed) {
+        return new Response(null, { status: 403 })
+      }
       return new Response(null, { headers: corsHeaders })
+    }
+
+    // For actual requests, if origin is not allowed, return 403
+    // Note: API key requests (from Next.js) bypass CORS check
+    if (!env.API_KEY && !cors.allowed) {
+      return new Response(
+        JSON.stringify({ error: 'Origin not allowed' }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } }
+      )
     }
 
     // Only allow POST
@@ -205,7 +358,39 @@ export default {
       )
     }
 
+    // Validate request body size (prevent DoS)
+    const contentLength = request.headers.get('Content-Length')
+    const MAX_BODY_SIZE = 1024 * 1024 * 10 // 10MB (images can be large)
+    if (contentLength && parseInt(contentLength) > MAX_BODY_SIZE) {
+      return new Response(
+        JSON.stringify({ error: 'Request body too large. Maximum size is 10MB.' }),
+        { status: 413, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
     try {
+      // Rate limiting - critical for expensive AI processing
+      if (env.MENU_PROCESS_RATE_LIMITER) {
+        const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown'
+        const { success } = await env.MENU_PROCESS_RATE_LIMITER.limit({ key: clientIP })
+
+        if (!success) {
+          return new Response(
+            JSON.stringify({
+              error: 'Rate limit exceeded. Please try again later.',
+              retry_after: 60
+            }),
+            {
+              status: 429,
+              headers: {
+                ...corsHeaders,
+                'Content-Type': 'application/json',
+                'Retry-After': '60'
+              }
+            }
+          )
+        }
+      }
       const contentType = request.headers.get('content-type') || ''
       const isMultipart = contentType.includes('multipart/form-data')
       let imageInput: string | ArrayBuffer
@@ -213,8 +398,7 @@ export default {
 
       // Default prompt for menu extraction with JSON output
       // Ultra-concise to minimize processing time and token usage
-      const getExtractionPrompt = (customPrompt?: string) => customPrompt || 
-        `You must return ONLY valid JSON. No text before, no text after, no explanations, no markdown code blocks.
+      const defaultPrompt = `You must return ONLY valid JSON. No text before, no text after, no explanations, no markdown code blocks.
 
 Required format:
 {"items":[{"id":"F1","name":"Item","description":"ingredients","price":"$8.99","category":"FUTOMAKI","section":"FUTOMAKI"}],"categories":["FUTOMAKI","UNA MAKI","SIGNATURE ROLL","SOYA PAPER ROLL"],"sections":["FUTOMAKI","UNA MAKI","SIGNATURE ROLL","SOYA PAPER ROLL"]}
@@ -222,6 +406,16 @@ Required format:
 Extract all 48 items: FUTOMAKI (F1-F8), UNA MAKI (U1-U24), SIGNATURE ROLL (R1-R10), SOYA PAPER ROLL (E11-E16). UNA MAKI prices: "ROLL $X.XX, HAND ROLL $X.XX".
 
 CRITICAL: Your response must be ONLY the JSON object. Do not include "Here is", "The JSON is", or any other text. Start directly with { and end with }.`
+
+      const getExtractionPrompt = (customPrompt?: string) => {
+        if (!customPrompt) {
+          return defaultPrompt
+        }
+        // Sanitize custom prompt to prevent injection
+        const sanitized = sanitizePrompt(customPrompt)
+        // If sanitization removed the prompt (injection detected), use default
+        return sanitized || defaultPrompt
+      }
 
       // Handle multipart/form-data (file upload from Postman)
       if (isMultipart) {
@@ -438,6 +632,19 @@ CRITICAL: Your response must be ONLY the JSON object. Do not include "Here is", 
               
               // Handle URL or base64
               if (typeof img === 'string') {
+                // Validate URL if it's a URL (SSRF protection)
+                if (img.startsWith('http://') || img.startsWith('https://')) {
+                  const urlValidation = isValidImageUrl(img, env)
+                  if (!urlValidation.valid) {
+                    results.push({
+                      image_index: i,
+                      text: '',
+                      parse_error: `Invalid image URL: ${urlValidation.reason}`,
+                      item_count: 0,
+                    })
+                    continue
+                  }
+                }
                 imgInput = img
               } else {
                 continue // Skip invalid entries
@@ -560,6 +767,17 @@ CRITICAL: Your response must be ONLY the JSON object. Do not include "Here is", 
               { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
             )
           }
+
+          // If it's a URL, validate it for SSRF protection
+          if (isValidUrl) {
+            const urlValidation = isValidImageUrl(imageInput, env)
+            if (!urlValidation.valid) {
+              return new Response(
+                JSON.stringify({ error: `Invalid image URL: ${urlValidation.reason}` }),
+                { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+              )
+            }
+          }
         }
       }
 
@@ -667,9 +885,26 @@ CRITICAL: Your response must be ONLY the JSON object. Do not include "Here is", 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     } catch (error: any) {
-      console.error('Text extraction error:', error)
+      // Log full error details server-side for debugging
+      console.error('Text extraction error:', {
+        message: error.message,
+        stack: error.stack,
+        name: error.name,
+      })
+
+      // Return generic error message to client (don't expose internal details)
+      // Only expose specific error messages for known validation errors
+      const errorMessage = error.message || 'Internal server error'
+      const isKnownError = errorMessage.includes('Invalid image') ||
+                          errorMessage.includes('URL') ||
+                          errorMessage.includes('format') ||
+                          errorMessage.includes('too large') ||
+                          errorMessage.includes('required')
+
       return new Response(
-        JSON.stringify({ error: error.message || 'Internal server error' }),
+        JSON.stringify({
+          error: isKnownError ? errorMessage : 'An error occurred while processing the image. Please try again.'
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }

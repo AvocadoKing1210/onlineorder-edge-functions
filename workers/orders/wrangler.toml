@@ -7,8 +7,10 @@ compatibility_date = "2024-11-01"
 # SUPABASE_ANON_KEY = "your-supabase-anon-key"
 # AUTH0_DOMAIN = "your-auth0-domain"
 # AUTH0_AUDIENCE = "your-auth0-audience" (optional)
+# API_KEY = "your-secret-api-key" (required for server-to-server auth from Next.js)
 # ALLOWED_ORIGINS = "https://example.com,https://app.example.com" (optional, comma-separated)
 #   If not set, allows all origins (*) - NOT RECOMMENDED for production
+#   Note: API key requests bypass CORS check
 
 # Rate limiting configuration
 # Note: You need to create a rate limit namespace in Cloudflare Dashboard first
@@ -35,3 +37,17 @@ name = "ORDER_RATE_LIMITER"
 namespace_id = "1001"  # Replace with your production namespace ID
 simple = { limit = 10, period = 60 }  # Stricter for production
 
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1

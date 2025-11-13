@@ -18,6 +18,7 @@ interface Env {
   AUTH0_CLIENT_ID?: string // Client ID for ID token audience validation
   ORDER_RATE_LIMITER?: any // Rate limiter binding
   ALLOWED_ORIGINS?: string // Comma-separated list of allowed origins (e.g., "https://example.com,https://app.example.com")
+  API_KEY?: string // API key for server-to-server authentication (from Next.js proxy)
 }
 
 interface CartItem {
@@ -121,6 +122,30 @@ async function validateCart(
 ): Promise<{ valid: boolean; error?: string; items?: any[] }> {
   if (!cart || cart.length === 0) {
     return { valid: false, error: 'Cart is empty' }
+  }
+
+  // Validate cart size limit
+  const MAX_CART_ITEMS = 50
+  if (cart.length > MAX_CART_ITEMS) {
+    return { valid: false, error: `Cart cannot contain more than ${MAX_CART_ITEMS} items` }
+  }
+
+  // Validate each cart item
+  for (const item of cart) {
+    // Validate quantity
+    if (!item.quantity || item.quantity < 1 || item.quantity > 100) {
+      return { valid: false, error: 'Item quantity must be between 1 and 100' }
+    }
+
+    // Validate menu_item_id format (should be UUID)
+    if (!item.menu_item_id || typeof item.menu_item_id !== 'string') {
+      return { valid: false, error: 'Invalid menu item ID' }
+    }
+
+    // Validate notes length if provided
+    if (item.notes && item.notes.length > 500) {
+      return { valid: false, error: 'Item notes cannot exceed 500 characters' }
+    }
   }
 
   // Fetch menu items from Supabase
@@ -325,6 +350,17 @@ function getCorsHeaders(request: Request, env: Env): { headers: Record<string, s
 // Main handler
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // Verify API key if configured (for server-to-server requests from Next.js)
+    if (env.API_KEY) {
+      const apiKey = request.headers.get('X-API-Key')
+      if (!apiKey || apiKey !== env.API_KEY) {
+        return new Response(
+          JSON.stringify({ error: 'Unauthorized: Invalid API key' }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } }
+        )
+      }
+    }
+
     // Get CORS headers based on origin
     const cors = getCorsHeaders(request, env)
     const corsHeaders = cors.headers
@@ -339,7 +375,8 @@ export default {
     }
 
     // For actual requests, if origin is not allowed, return 403
-    if (!cors.allowed) {
+    // Note: API key requests (from Next.js) bypass CORS check
+    if (!env.API_KEY && !cors.allowed) {
       return new Response(
         JSON.stringify({ error: 'Origin not allowed' }),
         { status: 403, headers: { 'Content-Type': 'application/json' } }
@@ -355,6 +392,16 @@ export default {
     }
 
     try {
+      // Validate request body size (prevent DoS)
+      const contentLength = request.headers.get('Content-Length')
+      const MAX_BODY_SIZE = 1024 * 100 // 100KB
+      if (contentLength && parseInt(contentLength) > MAX_BODY_SIZE) {
+        return new Response(
+          JSON.stringify({ error: 'Request body too large' }),
+          { status: 413, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+
       // Rate limiting - limit by IP address or user identifier
       if (env.ORDER_RATE_LIMITER) {
         const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown'
@@ -410,6 +457,83 @@ export default {
         customer_phone,
         delivery_address,
       } = body
+
+      // Validate mode
+      if (!mode || !['dine_in', 'takeout', 'delivery'].includes(mode)) {
+        return new Response(
+          JSON.stringify({ error: 'Invalid order mode. Must be dine_in, takeout, or delivery' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+
+      // Validate customer fields if provided
+      if (customer_name && customer_name.length > 100) {
+        return new Response(
+          JSON.stringify({ error: 'Customer name cannot exceed 100 characters' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+
+      if (customer_email) {
+        // Basic email validation
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+        if (!emailRegex.test(customer_email) || customer_email.length > 255) {
+          return new Response(
+            JSON.stringify({ error: 'Invalid email format' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          )
+        }
+      }
+
+      if (customer_phone && customer_phone.length > 20) {
+        return new Response(
+          JSON.stringify({ error: 'Phone number cannot exceed 20 characters' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+
+      if (special_instructions && special_instructions.length > 1000) {
+        return new Response(
+          JSON.stringify({ error: 'Special instructions cannot exceed 1000 characters' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+
+      // Validate idempotency_key if provided
+      if (idempotency_key && (idempotency_key.length > 255 || typeof idempotency_key !== 'string')) {
+        return new Response(
+          JSON.stringify({ error: 'Invalid idempotency key format' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+
+      // Validate delivery address if mode is delivery
+      if (mode === 'delivery' && delivery_address) {
+        if (!delivery_address.street || delivery_address.street.length > 200) {
+          return new Response(
+            JSON.stringify({ error: 'Delivery address street is required and cannot exceed 200 characters' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          )
+        }
+        if (!delivery_address.city || delivery_address.city.length > 100) {
+          return new Response(
+            JSON.stringify({ error: 'Delivery address city is required and cannot exceed 100 characters' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          )
+        }
+        if (!delivery_address.province || delivery_address.province.length > 100) {
+          return new Response(
+            JSON.stringify({ error: 'Delivery address province is required and cannot exceed 100 characters' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          )
+        }
+        if (!delivery_address.postal_code || delivery_address.postal_code.length > 20) {
+          return new Response(
+            JSON.stringify({ error: 'Delivery address postal code is required and cannot exceed 20 characters' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          )
+        }
+      }
 
       // Get user_id - SECURITY: Never trust client-provided user_id
       // For authenticated users: Always use JWT sub claim
@@ -504,9 +628,26 @@ export default {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     } catch (error: any) {
-      console.error('Order submission error:', error)
+      // Log full error details server-side for debugging
+      console.error('Order submission error:', {
+        message: error.message,
+        stack: error.stack,
+        name: error.name,
+      })
+      
+      // Return generic error message to client (don't expose internal details)
+      // Only expose specific error messages for known validation errors
+      const errorMessage = error.message || 'Internal server error'
+      const isKnownError = errorMessage.includes('Cart') || 
+                          errorMessage.includes('menu item') ||
+                          errorMessage.includes('Invalid') ||
+                          errorMessage.includes('cannot exceed') ||
+                          errorMessage.includes('required')
+      
       return new Response(
-        JSON.stringify({ error: error.message || 'Internal server error' }),
+        JSON.stringify({ 
+          error: isKnownError ? errorMessage : 'An error occurred while processing your order. Please try again.' 
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }

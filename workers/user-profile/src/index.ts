@@ -18,6 +18,9 @@ interface Env {
   AUTH0_DOMAIN: string
   AUTH0_AUDIENCE?: string
   AUTH0_CLIENT_ID?: string
+  PROFILE_RATE_LIMITER?: any // Rate limiter binding
+  ALLOWED_ORIGINS?: string // Comma-separated list of allowed origins
+  API_KEY?: string // API key for server-to-server authentication (from Next.js proxy)
 }
 
 interface UserProfileRequest {
@@ -188,19 +191,150 @@ async function updateUserProfile(
   return Array.isArray(profiles) ? profiles[0] : profiles
 }
 
+// Validate email format
+function isValidEmail(email: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+  return emailRegex.test(email) && email.length <= 255
+}
+
+// Validate phone number format (basic validation)
+function isValidPhone(phone: string): boolean {
+  // Allow international format: +1234567890 or basic format
+  const phoneRegex = /^[\+]?[(]?[0-9]{1,4}[)]?[-\s\.]?[(]?[0-9]{1,4}[)]?[-\s\.]?[0-9]{1,9}$/
+  return phoneRegex.test(phone) && phone.length <= 20
+}
+
+// Validate URL format
+function isValidUrl(url: string): boolean {
+  try {
+    const urlObj = new URL(url)
+    // Only allow http/https protocols
+    return (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') && url.length <= 500
+  } catch {
+    return false
+  }
+}
+
+// Validate locale format
+function isValidLocale(locale: string): boolean {
+  // Basic locale validation (e.g., en, en-US, zh-CN)
+  const localeRegex = /^[a-z]{2}(-[A-Z]{2})?$/
+  return localeRegex.test(locale) && locale.length <= 10
+}
+
+// Validate profile input data
+function validateProfileInput(data: UserProfileRequest): { valid: boolean; error?: string } {
+  // Validate email if provided
+  if (data.email !== undefined && data.email !== null && data.email !== '') {
+    if (!isValidEmail(data.email)) {
+      return { valid: false, error: 'Invalid email format' }
+    }
+  }
+
+  // Validate display_name if provided
+  if (data.display_name !== undefined && data.display_name !== null) {
+    if (data.display_name.length > 100) {
+      return { valid: false, error: 'Display name cannot exceed 100 characters' }
+    }
+  }
+
+  // Validate phone_number if provided
+  if (data.phone_number !== undefined && data.phone_number !== null && data.phone_number !== '') {
+    if (!isValidPhone(data.phone_number)) {
+      return { valid: false, error: 'Invalid phone number format' }
+    }
+  }
+
+  // Validate avatar_url if provided
+  if (data.avatar_url !== undefined && data.avatar_url !== null && data.avatar_url !== '') {
+    if (!isValidUrl(data.avatar_url)) {
+      return { valid: false, error: 'Invalid avatar URL format. Must be a valid http/https URL' }
+    }
+  }
+
+  // Validate preferred_locale if provided
+  if (data.preferred_locale !== undefined && data.preferred_locale !== null) {
+    if (!isValidLocale(data.preferred_locale)) {
+      return { valid: false, error: 'Invalid locale format. Use format like: en, en-US, zh-CN' }
+    }
+  }
+
+  return { valid: true }
+}
+
+// Get CORS headers based on request origin and allowed origins
+function getCorsHeaders(request: Request, env: Env): { headers: Record<string, string>; allowed: boolean } {
+  const origin = request.headers.get('Origin')
+  const allowedOrigins = env.ALLOWED_ORIGINS
+    ? env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : []
+
+  // If no allowed origins configured, allow all (backward compatibility)
+  // In production, you should always set ALLOWED_ORIGINS
+  let allowOrigin = '*'
+  let isAllowed = true
+
+  if (allowedOrigins.length > 0) {
+    // If origin is provided and is in allowed list, use it
+    if (origin && allowedOrigins.includes(origin)) {
+      allowOrigin = origin
+      isAllowed = true
+    } else if (origin) {
+      // Origin provided but not allowed - deny CORS
+      isAllowed = false
+      return { headers: {}, allowed: false }
+    } else {
+      // No origin header (same-origin request) - allow it
+      allowOrigin = '*'
+      isAllowed = true
+    }
+  }
+
+  return {
+    headers: {
+      'Access-Control-Allow-Origin': allowOrigin,
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
+      'Access-Control-Max-Age': '86400', // Cache preflight for 24 hours
+    },
+    allowed: isAllowed,
+  }
+}
+
 // Main handler
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, PUT, PATCH, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // Verify API key if configured (for server-to-server requests from Next.js)
+    if (env.API_KEY) {
+      const apiKey = request.headers.get('X-API-Key')
+      if (!apiKey || apiKey !== env.API_KEY) {
+        return new Response(
+          JSON.stringify({ error: 'Unauthorized: Invalid API key' }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } }
+        )
+      }
     }
 
-    // Handle OPTIONS request
+    // Get CORS headers based on origin
+    const cors = getCorsHeaders(request, env)
+    const corsHeaders = cors.headers
+
+    // Handle OPTIONS request (CORS preflight)
     if (request.method === 'OPTIONS') {
+      // If origin is not allowed, return 403
+      if (!cors.allowed) {
+        return new Response(null, { status: 403 })
+      }
       return new Response(null, { headers: corsHeaders })
+    }
+
+    // For actual requests, if origin is not allowed, return 403
+    // Note: API key requests (from Next.js) bypass CORS check
+    if (!env.API_KEY && !cors.allowed) {
+      return new Response(
+        JSON.stringify({ error: 'Origin not allowed' }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } }
+      )
     }
 
     // Allow GET (fetch profile) plus POST/PATCH/PUT (create/update)
@@ -211,7 +345,58 @@ export default {
       )
     }
 
+    // Validate request body size (prevent DoS)
+    const contentLength = request.headers.get('Content-Length')
+    const MAX_BODY_SIZE = 1024 * 10 // 10KB (profile data is small)
+    if (contentLength && parseInt(contentLength) > MAX_BODY_SIZE) {
+      return new Response(
+        JSON.stringify({ error: 'Request body too large' }),
+        { status: 413, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
     try {
+      // Rate limiting - limit by user identifier or IP
+      if (env.PROFILE_RATE_LIMITER) {
+        const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown'
+        let rateLimitKey = clientIP
+
+        // Try to get user ID from JWT for authenticated users
+        const authHeader = request.headers.get('Authorization')
+        if (authHeader?.startsWith('Bearer ')) {
+          try {
+            const token = authHeader.substring(7)
+            const jwt = await verifyAuth0JWT(token, env)
+            // Use user ID for authenticated users (more accurate rate limiting)
+            if (jwt?.sub) {
+              rateLimitKey = jwt.sub
+            }
+          } catch {
+            // If token verification fails, fall back to IP
+            rateLimitKey = clientIP
+          }
+        }
+
+        const { success } = await env.PROFILE_RATE_LIMITER.limit({ key: rateLimitKey })
+
+        if (!success) {
+          return new Response(
+            JSON.stringify({
+              error: 'Rate limit exceeded. Please try again later.',
+              retry_after: 60
+            }),
+            {
+              status: 429,
+              headers: {
+                ...corsHeaders,
+                'Content-Type': 'application/json',
+                'Retry-After': '60'
+              }
+            }
+          )
+        }
+      }
+
       // Require authentication - only authenticated users can create/update profiles
       // Guest customer info is stored directly in orders, not in profiles
       const authHeader = request.headers.get('Authorization')
@@ -254,6 +439,16 @@ export default {
 
       // Parse request body for write operations
       const body: UserProfileRequest = await request.json()
+
+      // Validate input data
+      const validation = validateProfileInput(body)
+      if (!validation.valid) {
+        return new Response(
+          JSON.stringify({ error: validation.error }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        )
+      }
+
       const {
         email,
         display_name,
@@ -307,9 +502,27 @@ export default {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     } catch (error: any) {
-      console.error('User profile error:', error)
+      // Log full error details server-side for debugging
+      console.error('User profile error:', {
+        message: error.message,
+        stack: error.stack,
+        name: error.name,
+      })
+
+      // Return generic error message to client (don't expose internal details)
+      // Only expose specific error messages for known validation errors
+      const errorMessage = error.message || 'Internal server error'
+      const isKnownError = errorMessage.includes('email') ||
+                          errorMessage.includes('phone') ||
+                          errorMessage.includes('Invalid') ||
+                          errorMessage.includes('cannot exceed') ||
+                          errorMessage.includes('required') ||
+                          errorMessage.includes('format')
+
       return new Response(
-        JSON.stringify({ error: error.message || 'Internal server error' }),
+        JSON.stringify({
+          error: isKnownError ? errorMessage : 'An error occurred while processing your profile. Please try again.'
+        }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
